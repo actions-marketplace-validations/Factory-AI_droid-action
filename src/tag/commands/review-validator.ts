@@ -5,27 +5,38 @@ import type { Octokits } from "../../github/api/client";
 import { fetchPRBranchData } from "../../github/data/pr-fetcher";
 import { createPrompt } from "../../create-prompt";
 import type { ReviewArtifacts } from "../../create-prompt/types";
-import { prepareMcpTools } from "../../mcp/install-mcp-server";
-import { normalizeDroidArgs, parseAllowedTools } from "../../utils/parse-tools";
+import {
+  normalizeDroidArgs,
+  stripToolSelectionArgs,
+} from "../../utils/parse-tools";
 import type { PrepareResult } from "../../prepare/types";
 import { generateReviewValidatorPrompt } from "../../create-prompt/templates/review-validator-prompt";
 import { resolveReviewConfig } from "../../utils/review-depth";
 import { applyModelPolicyFallback } from "../../utils/model-policy";
+import { assertDroidRunType, DroidRunType } from "../../run-type";
+import { githubReviewSessionTagArg } from "../../utils/review-session-tag";
 
-export async function prepareReviewValidatorMode({
-  context,
-  octokit,
-  githubToken,
-  trackingCommentId,
-}: {
+export async function prepareReviewValidatorMode(options: {
   context: GitHubContext;
   octokit: Octokits;
   githubToken: string;
   trackingCommentId: number;
+  runType?: DroidRunType;
 }): Promise<PrepareResult> {
+  const {
+    context,
+    octokit,
+    trackingCommentId,
+    runType = DroidRunType.Review,
+  } = options;
   if (!isEntityContext(context) || !context.isPR) {
     throw new Error("review validator mode requires pull request context");
   }
+  assertDroidRunType(runType, [
+    DroidRunType.Default,
+    DroidRunType.Review,
+    DroidRunType.SecurityReview,
+  ]);
 
   const prData = await fetchPRBranchData({
     octokits: octokit,
@@ -63,14 +74,15 @@ export async function prepareReviewValidatorMode({
     includeSuggestions,
   });
 
-  core.exportVariable("DROID_EXEC_RUN_TYPE", "droid-review");
-
   const rawUserArgs = process.env.DROID_ARGS || "";
-  const normalizedUserArgs = normalizeDroidArgs(rawUserArgs);
-  const userAllowedMCPTools = parseAllowedTools(normalizedUserArgs).filter(
-    (tool) => tool.startsWith("github_") && tool.includes("___"),
+  const normalizedUserArgs = stripToolSelectionArgs(
+    normalizeDroidArgs(rawUserArgs),
   );
 
+  // Pass 2 only writes review_validated.json. It receives no GitHub mutation
+  // tools, and the action steps that run it withhold GITHUB_TOKEN, so a
+  // prompt-injected diff has neither a tool nor a credential to reach GitHub
+  // through `Execute`. github-post-review.ts performs the sole API write.
   const baseTools = [
     "Read",
     "Grep",
@@ -80,28 +92,17 @@ export async function prepareReviewValidatorMode({
     "ApplyPatch",
     "Create",
     "Edit",
-    "github_comment___update_droid_comment",
+    "Skill",
   ];
 
-  const validatorTools = ["github_pr___submit_review"];
-
-  const allowedTools = Array.from(
-    new Set([...baseTools, ...validatorTools, ...userAllowedMCPTools]),
-  );
-
-  const mcpTools = await prepareMcpTools({
-    githubToken,
-    owner: context.repository.owner,
-    repo: context.repository.repo,
-    droidCommentId: trackingCommentId.toString(),
-    allowedTools,
-    mode: "tag",
-    context,
-  });
+  const allowedTools = Array.from(new Set(baseTools));
+  const mcpTools = JSON.stringify({ mcpServers: {} });
 
   const droidArgParts: string[] = [];
   droidArgParts.push(`--enabled-tools "${allowedTools.join(",")}"`);
-  droidArgParts.push('--tag "code-review"');
+  droidArgParts.push(
+    githubReviewSessionTagArg({ pass: "validator", runType, context }),
+  );
 
   const { model, reasoningEffort, fallbackNote } =
     await applyModelPolicyFallback(
